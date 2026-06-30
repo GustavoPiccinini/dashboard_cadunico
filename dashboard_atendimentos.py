@@ -169,7 +169,7 @@ def safe_col(key: str):
 # UPLOAD
 # ══════════════════════════════════════════════
 st.sidebar.markdown("---")
-st.sidebar.title(" Configurações")
+st.sidebar.title("⚙️ Configurações")
 st.sidebar.markdown("---")
 
 uploaded = st.sidebar.file_uploader(
@@ -232,12 +232,14 @@ cadunico_files = st.sidebar.file_uploader(
 CADUNICO_DIR = os.path.join(tempfile.gettempdir(), "cadunico_parquet")
 os.makedirs(CADUNICO_DIR, exist_ok=True)
 
+def _normalize_colname(c):
+    return str(c).strip().lower().replace(" ", "").split(".")[-1]
+
 def _find_col(df_cols, target_lower):
-    """Encontra coluna no df ignorando case e prefixo de tabela (d./p.)."""
-    target_clean = target_lower.split(".")[-1]
+    """Encontra coluna no df ignorando case, espaços e prefixo de tabela (d./p.)."""
+    target_clean = _normalize_colname(target_lower)
     for c in df_cols:
-        c_clean = str(c).strip().lower().split(".")[-1]
-        if c_clean == target_clean:
+        if _normalize_colname(c) == target_clean:
             return c
     return None
 
@@ -249,7 +251,21 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
 
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     if suffix == ".csv":
-        df_raw = pd.read_csv(uploaded_file, dtype=str, low_memory=False)
+        # Detecta o separador automaticamente (CECAD costuma usar ';' ou '\t')
+        df_raw = None
+        last_err = None
+        for sep in [";", ",", "\t", "|"]:
+            try:
+                uploaded_file.seek(0)
+                df_try = pd.read_csv(uploaded_file, dtype=str, low_memory=False, sep=sep)
+                if df_try.shape[1] > 1:
+                    df_raw = df_try
+                    break
+            except Exception as e:
+                last_err = e
+        if df_raw is None:
+            uploaded_file.seek(0)
+            df_raw = pd.read_csv(uploaded_file, dtype=str, low_memory=False, sep=None, engine="python")
     else:
         df_raw = pd.read_excel(uploaded_file, dtype=str)
 
@@ -262,7 +278,11 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
             col_map[key] = found
 
     if "cpf" not in col_map and "nis" not in col_map:
-        raise ValueError(f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name}.")
+        preview = ", ".join(str(c) for c in df_raw.columns[:15])
+        raise ValueError(
+            f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name} "
+            f"({df_raw.shape[1]} colunas detectadas). Primeiras colunas lidas: {preview}"
+        )
 
     cols_existentes = list(col_map.values())
     df_slim = df_raw[cols_existentes].copy()
