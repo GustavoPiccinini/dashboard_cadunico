@@ -235,9 +235,18 @@ os.makedirs(CADUNICO_DIR, exist_ok=True)
 def _normalize_colname(c):
     return str(c).strip().lower().replace(" ", "").split(".")[-1]
 
+def _normalize_colname_keep_prefix(c):
+    return str(c).strip().lower().replace(" ", "")
+
 def _find_col(df_cols, target_lower):
-    """Encontra coluna no df ignorando case, espaços e prefixo de tabela (d./p.)."""
+    """Encontra coluna no df, priorizando match exato com prefixo; cai para match sem prefixo se necessário."""
+    target_exact = _normalize_colname_keep_prefix(target_lower)
     target_clean = _normalize_colname(target_lower)
+    # 1ª tentativa: match exato incluindo prefixo (d. ou p.)
+    for c in df_cols:
+        if _normalize_colname_keep_prefix(c) == target_exact:
+            return c
+    # 2ª tentativa: match ignorando prefixo
     for c in df_cols:
         if _normalize_colname(c) == target_clean:
             return c
@@ -251,21 +260,46 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
 
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     if suffix == ".csv":
-        # Detecta o separador automaticamente (CECAD costuma usar ';' ou '\t')
-        df_raw = None
-        last_err = None
-        for sep in [";", ",", "\t", "|"]:
+        uploaded_file.seek(0)
+        raw_bytes = uploaded_file.read()
+        raw_text = None
+        for encoding in ["utf-8-sig", "utf-8", "latin1", "cp1252"]:
             try:
-                uploaded_file.seek(0)
-                df_try = pd.read_csv(uploaded_file, dtype=str, low_memory=False, sep=sep)
-                if df_try.shape[1] > 1:
-                    df_raw = df_try
-                    break
-            except Exception as e:
-                last_err = e
-        if df_raw is None:
-            uploaded_file.seek(0)
-            df_raw = pd.read_csv(uploaded_file, dtype=str, low_memory=False, sep=None, engine="python")
+                raw_text = raw_bytes.decode(encoding)
+                break
+            except Exception:
+                continue
+        if raw_text is None:
+            raise ValueError(f"Não consegui decodificar {uploaded_file.name}.")
+
+        linhas = raw_text.splitlines()
+        alvo_norm = set(_normalize_colname(v) for v in CADUNICO_COLS.values())
+
+        # Para cada separador candidato, encontra a primeira linha (nas primeiras 30)
+        # cujos campos batem com pelo menos 2 colunas-alvo conhecidas — essa é a linha de cabeçalho real.
+        candidatos_sep = ["\t", ";", ",", "|"]
+        melhor_sep, melhor_header_idx, melhor_hits = None, None, 0
+        for sep in candidatos_sep:
+            for idx, linha in enumerate(linhas[:30]):
+                campos_norm = [_normalize_colname(x) for x in linha.split(sep)]
+                hits = sum(1 for c in campos_norm if c in alvo_norm)
+                if hits > melhor_hits:
+                    melhor_hits = hits
+                    melhor_sep = sep
+                    melhor_header_idx = idx
+
+        if melhor_sep is None:
+            raise ValueError(
+                f"Não consegui identificar a linha de cabeçalho em {uploaded_file.name}. "
+                f"Verifique se o arquivo contém as colunas esperadas (ex: p.num_cpf_pessoa)."
+            )
+
+        import io as _io
+        df_raw = pd.read_csv(
+            _io.StringIO(raw_text), dtype=str,
+            sep=melhor_sep, skiprows=melhor_header_idx, engine="python",
+            on_bad_lines="skip"
+        )
     else:
         df_raw = pd.read_excel(uploaded_file, dtype=str)
 
