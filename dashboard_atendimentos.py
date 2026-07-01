@@ -254,10 +254,10 @@ def _find_col(df_cols, target_lower):
 
 def processar_arquivo_cadunico(uploaded_file) -> str:
     """Lê 1 arquivo do CadÚnico, extrai só as colunas relevantes, salva como Parquet. Retorna o caminho."""
-    out_path = os.path.join(CADUNICO_DIR, f"{uploaded_file.name}.parquet")
-    if os.path.exists(out_path):
-        return out_path
+    safe_name = uploaded_file.name.replace("/", "_").replace("\\", "_")
+    out_path = os.path.join(CADUNICO_DIR, f"{safe_name}.parquet")
 
+    # NÃO usa cache — reprocessa sempre para evitar Parquets corrompidos de versões anteriores
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     if suffix == ".csv":
         uploaded_file.seek(0)
@@ -275,8 +275,6 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
         linhas = raw_text.splitlines()
         alvo_norm = set(_normalize_colname(v) for v in CADUNICO_COLS.values())
 
-        # Para cada separador candidato, encontra a primeira linha (nas primeiras 30)
-        # cujos campos batem com pelo menos 2 colunas-alvo conhecidas — essa é a linha de cabeçalho real.
         candidatos_sep = ["\t", ";", ",", "|"]
         melhor_sep, melhor_header_idx, melhor_hits = None, None, 0
         for sep in candidatos_sep:
@@ -288,10 +286,13 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
                     melhor_sep = sep
                     melhor_header_idx = idx
 
-        if melhor_sep is None:
+        if melhor_hits < 1:
+            # Diagnóstico: mostra primeiras 3 linhas e separadores tentados
+            preview_linhas = "\n".join(f"  linha {i}: {l[:120]!r}" for i, l in enumerate(linhas[:5]))
             raise ValueError(
-                f"Não consegui identificar a linha de cabeçalho em {uploaded_file.name}. "
-                f"Verifique se o arquivo contém as colunas esperadas (ex: p.num_cpf_pessoa)."
+                f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name}.\n"
+                f"Primeiras linhas do arquivo:\n{preview_linhas}\n"
+                f"Colunas esperadas (ex): p.num_cpf_pessoa, p.num_nis_pessoa_atual"
             )
 
         import io as _io
@@ -303,6 +304,7 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
     else:
         df_raw = pd.read_excel(uploaded_file, dtype=str)
 
+    # Strip em todos os nomes de coluna (remove espaços antes/depois, inclusive " d.col")
     df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
     col_map = {}
@@ -312,10 +314,11 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
             col_map[key] = found
 
     if "cpf" not in col_map and "nis" not in col_map:
-        preview = ", ".join(str(c) for c in df_raw.columns[:15])
+        preview = ", ".join(f"'{c}'" for c in df_raw.columns[:20])
         raise ValueError(
             f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name} "
-            f"({df_raw.shape[1]} colunas detectadas). Primeiras colunas lidas: {preview}"
+            f"({df_raw.shape[1]} colunas, sep={repr(melhor_sep)}, header_linha={melhor_header_idx}).\n"
+            f"Primeiras colunas lidas: {preview}"
         )
 
     cols_existentes = list(col_map.values())
@@ -491,7 +494,7 @@ st.markdown("---")
 # ══════════════════════════════════════════════
 # ABAS
 # ══════════════════════════════════════════════
-aba_reg, aba_graf, aba_at, aba_alertas, aba_recorr, aba_cad, aba_exp = st.tabs(["📄 Individuos", "📊 Gráficos", "👥 Atendentes", "🚨 Alertas", "🔄 Recorrência Alternada", "🔗 CadÚnico", "📥 Exportar"])
+aba_reg, aba_alertas, aba_recorr, aba_cad, aba_exp = st.tabs(["📄 Individuos", "🚨 Alertas", "🔄 Recorrência Alternada", "🔗 CadÚnico", "📥 Exportar"])
 
 
 # ─────────────────────────────────────
@@ -546,252 +549,7 @@ with aba_reg:
                 st.plotly_chart(fig, use_container_width=True)
 
 # ─────────────────────────────────────
-# ABA 2 — GRÁFICOS
-# ─────────────────────────────────────
-with aba_graf:
-    if total_f == 0:
-        st.warning("Nenhum dado com os filtros atuais.")
-    else:
-        g1, g2 = st.columns(2)
-        with g1:
-            if c_servico:
-                d = run(f'SELECT "{c_servico}" AS Servico, COUNT(*) AS Qtd FROM dados {where_sql} GROUP BY "{c_servico}" ORDER BY Qtd DESC LIMIT 10')
-                fig1 = px.bar(d, x="Qtd", y="Servico", orientation="h", title="Por tipo de serviço",
-                              color="Qtd", color_continuous_scale="Teal", text="Qtd",
-                              height=altura_grafico(len(d)))
-                fig1.update_layout(coloraxis_showscale=False, yaxis_title=None, xaxis_title="Quantidade")
-                fig1.update_traces(textposition="outside")
-                st.plotly_chart(fig1, use_container_width=True)
-        with g2:
-            if c_unidade:
-                d = run(f'SELECT "{c_unidade}" AS Unidade, COUNT(*) AS Qtd FROM dados {where_sql} GROUP BY "{c_unidade}" ORDER BY Qtd DESC')
-                fig2 = px.bar(d, x="Qtd", y="Unidade", orientation="h", title="Por unidade",
-                              color="Qtd", color_continuous_scale="Purples", text="Qtd",
-                              height=altura_grafico(len(d)))
-                fig2.update_layout(coloraxis_showscale=False, yaxis_title=None, xaxis_title="Quantidade")
-                fig2.update_traces(textposition="outside")
-                st.plotly_chart(fig2, use_container_width=True)
-
-        g3, g4 = st.columns(2)
-        with g3:
-            if c_login:
-                try:
-                    d = run(f'SELECT "{c_login}" AS Atendente, COUNT(*) AS Qtd FROM dados {where_sql} GROUP BY "{c_login}" ORDER BY Qtd DESC LIMIT 10')
-                    fig3 = px.bar(d, x="Qtd", y="Atendente", orientation="h", title="Top 10 atendentes",
-                                  color="Qtd", color_continuous_scale="Oranges", text="Qtd",
-                                  height=altura_grafico(len(d)))
-                    fig3.update_layout(coloraxis_showscale=False, yaxis_title=None, xaxis_title="Quantidade")
-                    fig3.update_traces(textposition="outside")
-                    st.plotly_chart(fig3, use_container_width=True)
-                except Exception:
-                    st.caption("Gráfico de atendentes indisponível.")
-        with g4:
-            if c_data:
-                try:
-                    w_data = f"{where_sql} AND" if where_sql.strip() else "WHERE"
-                    d = run(f'''
-                        SELECT STRFTIME(CAST("{c_data}" AS DATE), '%Y-%m') AS Mes, COUNT(*) AS Qtd
-                        FROM dados {w_data} "{c_data}" IS NOT NULL
-                        GROUP BY Mes ORDER BY Mes
-                    ''')
-                    if not d.empty:
-                        # Destacar últimos 12 meses
-                        d = d.tail(24)
-                        fig4 = px.line(d, x="Mes", y="Qtd", title="Evolução mensal (últimos 24 meses)", markers=True)
-                        fig4.update_layout(xaxis_title="Mês", yaxis_title="Atendimentos",
-                                           xaxis_tickangle=-45)
-                        fig4.update_traces(line_color="#1f77b4", line_width=2)
-                        st.plotly_chart(fig4, use_container_width=True)
-                except Exception:
-                    st.caption("Gráfico de evolução indisponível.")
-
-        # Ranking clicável — Serviços e CPFs
-        if c_servico and c_cpf:
-            st.markdown("##### 🏆 Ranking — Serviços mais procurados")
-            top_svc = run(f'SELECT "{c_servico}" AS Servico, COUNT(*) AS Total, COUNT(DISTINCT "{c_cpf}") AS CPFs_unicos FROM dados {where_sql} GROUP BY "{c_servico}" ORDER BY Total DESC LIMIT 10')
-            ev_svc = st.dataframe(top_svc, use_container_width=True, hide_index=True,
-                                  on_select="rerun", selection_mode="single-row")
-            svc_sel_rows = ev_svc.selection.rows if hasattr(ev_svc, "selection") else []
-            if svc_sel_rows:
-                svc_nome = top_svc.iloc[svc_sel_rows[0]]["Servico"]
-                svc_safe = esc(svc_nome)
-                st.markdown(f"**Registros para: {svc_nome}**")
-                cols_svc = [c for c in [c_nome, c_cpf, c_unidade, c_data, c_login] if c]
-                and_or = "AND" if where_sql else "WHERE"
-                df_svc = run("SELECT " + ", ".join([chr(34)+c+chr(34) for c in cols_svc]) + " FROM dados " + where_sql + " " + and_or + " " + chr(34) + c_servico + chr(34) + " = '" + svc_safe + "' LIMIT 200")
-                st.dataframe(df_svc, use_container_width=True, hide_index=True)
-
-            st.markdown("##### 👤 Top 10 CPFs com mais atendimentos")
-            if c_nome:
-                top_cpf = run(f'SELECT "{c_nome}" AS Nome, "{c_cpf}" AS CPF, COUNT(*) AS Atendimentos FROM dados {where_sql} GROUP BY "{c_cpf}", "{c_nome}" ORDER BY Atendimentos DESC LIMIT 10')
-            else:
-                top_cpf = run(f'SELECT "{c_cpf}" AS CPF, COUNT(*) AS Atendimentos FROM dados {where_sql} GROUP BY "{c_cpf}" ORDER BY Atendimentos DESC LIMIT 10')
-            ev_cpf = st.dataframe(top_cpf, use_container_width=True, hide_index=True,
-                                  on_select="rerun", selection_mode="single-row")
-            cpf_sel_rows = ev_cpf.selection.rows if hasattr(ev_cpf, "selection") else []
-            if cpf_sel_rows:
-                cpf_click = top_cpf.iloc[cpf_sel_rows[0]]["CPF"]
-                cpf_safe = esc(str(cpf_click))
-                nome_click = top_cpf.iloc[cpf_sel_rows[0]].get("Nome", cpf_click)
-                total_click = run_val("SELECT COUNT(*) FROM dados WHERE " + chr(34) + c_cpf + chr(34) + " = '" + cpf_safe + "'")
-                st.markdown(f"**Histórico: {nome_click} — {total_click:,} atendimentos**")
-                cols_h = [c for c in [c_data, c_servico, c_unidade, c_login, c_categoria] if c]
-                df_click = run("SELECT " + ", ".join([chr(34)+c+chr(34) for c in cols_h]) + " FROM dados WHERE " + chr(34) + c_cpf + chr(34) + " = '" + cpf_safe + "' ORDER BY " + chr(34) + str(c_data or "") + chr(34) + " DESC LIMIT 200")
-                st.dataframe(df_click, use_container_width=True, hide_index=True)
-
-# ─────────────────────────────────────
-# ABA 3 — ATENDENTES E UNIDADES
-# ─────────────────────────────────────
-with aba_at:
-    st.subheader("Perfil por atendente e unidade")
-    w_base = f"{where_sql} AND" if where_sql.strip() else "WHERE"
-
-    col_fat, col_funi = st.columns(2)
-    with col_fat:
-        if c_login:
-            atendentes = run(f'SELECT DISTINCT "{c_login}" FROM dados {w_base} "{c_login}" IS NOT NULL ORDER BY "{c_login}"')[c_login].tolist()
-            at_sels = st.multiselect("Selecione atendentes", atendentes)
-        else:
-            at_sels = []
-    with col_funi:
-        if c_unidade:
-            unidades_at = run(f'SELECT DISTINCT "{c_unidade}" FROM dados {w_base} "{c_unidade}" IS NOT NULL ORDER BY "{c_unidade}"')[c_unidade].tolist()
-            uni_sels = st.multiselect("Selecione unidades", unidades_at)
-        else:
-            uni_sels = []
-
-    # Monta WHERE combinado
-    if at_sels or uni_sels:
-        wheres_at = []
-        if at_sels and c_login:
-            at_lista = ", ".join(["'" + esc(a) + "'" for a in at_sels])
-            wheres_at.append(f'"{c_login}" IN ({at_lista})')
-        if uni_sels and c_unidade:
-            uni_lista = ", ".join(["'" + esc(u) + "'" for u in uni_sels])
-            wheres_at.append(f'"{c_unidade}" IN ({uni_lista})')
-        w_at = "WHERE " + " AND ".join(wheres_at)
-
-        # ── Métricas ──
-        tot_at  = run_val(f"SELECT COUNT(*) FROM dados {w_at}")
-        q_cpf   = f'SELECT COUNT(DISTINCT "{c_cpf}") FROM dados {w_at}'
-        q_uni   = f'SELECT COUNT(DISTINCT "{c_unidade}") FROM dados {w_at}'
-        q_svc   = f'SELECT COUNT(DISTINCT "{c_servico}") FROM dados {w_at}'
-        cpf_at  = run_val(q_cpf)  if c_cpf     else None
-        uni_cnt = run_val(q_uni)  if c_unidade else None
-        svc_cnt = run_val(q_svc)  if c_servico else None
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total atendimentos", f"{tot_at:,}")
-        m2.metric("CPFs atendidos",     f"{cpf_at:,}"  if cpf_at  is not None else "—")
-        m3.metric("Unidades",           f"{uni_cnt:,}" if uni_cnt is not None else "—")
-        m4.metric("Tipos de serviço",   f"{svc_cnt:,}" if svc_cnt is not None else "—")
-
-        # ── Comparativo atendentes (se mais de 1 selecionado) ──
-        if c_login and len(at_sels) > 1:
-            st.markdown("##### Comparativo entre atendentes")
-            d_comp = run(f'SELECT "{c_login}" AS Atendente, COUNT(*) AS Total FROM dados {w_at} GROUP BY "{c_login}" ORDER BY Total DESC')
-            fig_comp = px.bar(d_comp, x="Atendente", y="Total", color="Atendente",
-                              text="Total", title="Total por atendente",
-                              height=altura_grafico(len(d_comp), por_item=60))
-            fig_comp.update_layout(showlegend=False, xaxis_title=None)
-            fig_comp.update_traces(textposition="outside")
-            st.plotly_chart(fig_comp, use_container_width=True)
-
-        # ── Comparativo unidades (se mais de 1 selecionada) ──
-        if c_unidade and len(uni_sels) > 1:
-            st.markdown("##### Comparativo entre unidades")
-            d_uni_comp = run(f'SELECT "{c_unidade}" AS Unidade, COUNT(*) AS Total FROM dados {w_at} GROUP BY "{c_unidade}" ORDER BY Total DESC')
-            fig_uni = px.bar(d_uni_comp, x="Unidade", y="Total", color="Unidade",
-                             text="Total", title="Total por unidade",
-                             height=altura_grafico(len(d_uni_comp), por_item=60))
-            fig_uni.update_layout(showlegend=False, xaxis_title=None)
-            fig_uni.update_traces(textposition="outside")
-            st.plotly_chart(fig_uni, use_container_width=True)
-
-        # ── Gráficos ──
-        gl, gr = st.columns(2)
-        with gl:
-            if c_servico:
-                d_svc = run(f'SELECT "{c_servico}" AS Servico, COUNT(*) AS Qtd FROM dados {w_at} GROUP BY "{c_servico}" ORDER BY Qtd DESC LIMIT 10')
-                fig_s = px.bar(d_svc, x="Qtd", y="Servico", orientation="h",
-                               title="Serviços realizados (top 10)",
-                               color="Qtd", color_continuous_scale="Teal", text="Qtd",
-                               height=altura_grafico(len(d_svc)))
-                fig_s.update_layout(coloraxis_showscale=False, yaxis_title=None)
-                fig_s.update_traces(textposition="outside")
-                st.plotly_chart(fig_s, use_container_width=True)
-        with gr:
-            if c_unidade and not uni_sels:
-                # Só mostra pizza de unidade se não filtrou por unidade específica
-                d_uni = run(f'SELECT "{c_unidade}" AS Unidade, COUNT(*) AS Qtd FROM dados {w_at} GROUP BY "{c_unidade}"')
-                fig_u = px.pie(d_uni, names="Unidade", values="Qtd", title="Distribuição por unidade")
-                st.plotly_chart(fig_u, use_container_width=True)
-            elif c_login and not at_sels:
-                d_log = run(f'SELECT "{c_login}" AS Atendente, COUNT(*) AS Qtd FROM dados {w_at} GROUP BY "{c_login}" ORDER BY Qtd DESC LIMIT 10')
-                fig_l = px.pie(d_log, names="Atendente", values="Qtd", title="Distribuição por atendente")
-                st.plotly_chart(fig_l, use_container_width=True)
-
-        # ── Tabela clicável ──
-        cols_at = [c for c in [c_nome, c_cpf, c_login, c_servico, c_data, c_unidade] if c]
-        col_sel = ", ".join([f'"{c}"' for c in cols_at])
-        df_at = run(f"SELECT {col_sel} FROM dados {w_at} LIMIT 500")
-        st.markdown("##### Registros — clique em uma linha para ver o perfil do cidadão")
-        ev_at = st.dataframe(df_at, use_container_width=True, hide_index=True,
-                             on_select="rerun", selection_mode="single-row")
-
-        sel_at = ev_at.selection.rows if hasattr(ev_at, "selection") else []
-        if sel_at and c_cpf:
-            row_at = df_at.iloc[sel_at[0]]
-            cpf_at_sel = str(row_at.get(c_cpf, "")).replace("'", "''")
-            if cpf_at_sel:
-                st.markdown("---")
-                nome_at_sel = row_at.get(c_nome, "Cidadão")
-                st.subheader(f"👤 Perfil: {nome_at_sel}")
-
-                total_cpf_at = run_val("SELECT COUNT(*) FROM dados WHERE " + chr(34) + c_cpf + chr(34) + " = '" + cpf_at_sel + "'")
-                pa, pb, pc, pd_ = st.columns(4)
-                pa.metric("CPF",           cpf_at_sel)
-                pb.metric("NIS",           str(row_at.get(c_nis,  "—")))
-                pc.metric("Nascimento",    str(row_at.get(c_nasc, "—")))
-                pd_.metric("Atendimentos", f"{total_cpf_at:,}")
-
-                cols_h = [c for c in [c_data, c_servico, c_unidade, c_quantia, c_login, c_categoria] if c]
-                col_h_sel = ", ".join([f'"{c}"' for c in cols_h])
-                df_hist_at = run("SELECT " + col_h_sel + " FROM dados WHERE " + chr(34) + c_cpf + chr(34) + " = '" + cpf_at_sel + "' ORDER BY " + chr(34) + str(c_data or "") + chr(34) + " DESC LIMIT 500")
-                st.markdown("##### Histórico completo de serviços")
-                st.dataframe(df_hist_at, use_container_width=True, hide_index=True)
-
-                if c_servico and not df_hist_at.empty:
-                    svc_at_c = run("SELECT " + chr(34) + c_servico + chr(34) + " AS Servico, COUNT(*) AS Qtd FROM dados WHERE " + chr(34) + c_cpf + chr(34) + " = '" + cpf_at_sel + "' GROUP BY " + chr(34) + c_servico + chr(34) + " ORDER BY Qtd DESC")
-                    fig_h = px.bar(svc_at_c, x="Qtd", y="Servico", orientation="h",
-                                   title="Serviços recebidos", color="Qtd",
-                                   color_continuous_scale="Blues", text="Qtd")
-                    fig_h.update_layout(coloraxis_showscale=False, yaxis_title=None, xaxis_title="Quantidade")
-                    fig_h.update_traces(textposition="outside")
-                    st.plotly_chart(fig_h, use_container_width=True)
-        # ── Exportar desta seleção ──
-        st.markdown("---")
-        st.markdown("##### 📥 Exportar dados desta seleção")
-        EXPORT_LIMIT_AT = 50_000
-        col_at_exp = [c for c in [c_nome, c_cpf, c_nis, c_nasc, c_login, c_servico, c_data, c_unidade, c_categoria] if c]
-        df_at_exp = run("SELECT " + ", ".join([chr(34)+c+chr(34) for c in col_at_exp]) + " FROM dados " + w_at + " LIMIT " + str(EXPORT_LIMIT_AT))
-        out_at = io.BytesIO()
-        with pd.ExcelWriter(out_at, engine="openpyxl") as writer:
-            df_at_exp.to_excel(writer, index=False, sheet_name="Atendimentos")
-            if c_login:
-                run("SELECT " + chr(34) + c_login + chr(34) + " AS Atendente, COUNT(*) AS Total FROM dados " + w_at + " GROUP BY " + chr(34) + c_login + chr(34) + " ORDER BY Total DESC").to_excel(writer, index=False, sheet_name="Por Atendente")
-            if c_servico:
-                run("SELECT " + chr(34) + c_servico + chr(34) + " AS Servico, COUNT(*) AS Total FROM dados " + w_at + " GROUP BY " + chr(34) + c_servico + chr(34) + " ORDER BY Total DESC").to_excel(writer, index=False, sheet_name="Por Serviço")
-            if c_unidade:
-                run("SELECT " + chr(34) + c_unidade + chr(34) + " AS Unidade, COUNT(*) AS Total FROM dados " + w_at + " GROUP BY " + chr(34) + c_unidade + chr(34) + " ORDER BY Total DESC").to_excel(writer, index=False, sheet_name="Por Unidade")
-        st.download_button("⬇️ Baixar Excel desta seleção", out_at.getvalue(), "atendimentos_selecao.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
-    else:
-        st.info("Selecione ao menos um atendente ou uma unidade para ver os dados.")
-
-# ─────────────────────────────────────
-# ABA 4 — ALERTAS
+# ABA 2 — ALERTAS
 # ─────────────────────────────────────
 with aba_alertas:
     st.subheader("🚨 Alertas e indicadores")
@@ -1187,11 +945,15 @@ with aba_recorr:
             st.error(f"Erro na análise de recorrência: {e}")
 
 # ─────────────────────────────────────
-# ABA 6 — CADÚNICO (cruzamento)
+# ABA — CADÚNICO / DEMANDA REPRIMIDA
 # ─────────────────────────────────────
 with aba_cad:
-    st.subheader("🔗 Cruzamento com o CadÚnico")
-    st.caption("Identifica cidadãos presentes nas duas bases e padrões de entrada/saída no CadÚnico.")
+    st.subheader("🔗 CadÚnico — Demanda Reprimida")
+    st.caption(
+        "**Demanda reprimida**: pessoas cadastradas no CadÚnico que **nunca foram atendidas** ou "
+        "que foram atendidas mas **não constam mais** na base de atendimentos. "
+        "O cruzamento é feito por CPF."
+    )
 
     if not cadunico_loaded:
         st.info("📂 Carregue ao menos 1 arquivo do CadÚnico na barra lateral para usar esta aba.")
@@ -1200,265 +962,252 @@ with aba_cad:
     else:
         con = get_con()
 
-        # Última competência carregada do CadÚnico
-        ultima_ref = con.execute("SELECT MAX(ref_cad) FROM cadunico").fetchone()[0]
-        st.caption(f"Competência mais recente do CadÚnico carregada: **{ultima_ref}**")
+        # Competências disponíveis para escolha
+        try:
+            refs_disp = con.execute(
+                "SELECT DISTINCT ref_cad FROM cadunico WHERE ref_cad IS NOT NULL ORDER BY ref_cad"
+            ).df()["ref_cad"].tolist()
+        except Exception:
+            refs_disp = []
 
-        sub1, sub2, sub3 = st.tabs([
-            "✅ Atualmente nos 2 bancos",
-            "🔁 3+ ciclos no CadÚnico",
-            "🪪 Sem CPF (via NIS)"
-        ])
+        if not refs_disp:
+            st.warning("Nenhuma competência encontrada no CadÚnico carregado.")
+        else:
+            ref_sel = st.selectbox(
+                "📅 Competência do CadÚnico a analisar",
+                refs_disp,
+                index=len(refs_disp) - 1,
+                help="Selecione o mês de referência do CadÚnico para identificar quem está no programa nesse período."
+            )
 
-        # ── Cruzamento 1: atualmente nos dois bancos ──
-        with sub1:
-            st.markdown("##### Pessoas com registro atual no CadÚnico **e** com atendimento no período carregado")
-            try:
-                sql_atual = f"""
-                    WITH cad_atual AS (
-                        SELECT DISTINCT cpf, nis, nome, nascimento
-                        FROM cadunico
-                        WHERE ref_cad = (SELECT MAX(ref_cad) FROM cadunico)
-                          AND cpf IS NOT NULL
-                    ),
-                    atend_cpf AS (
-                        SELECT DISTINCT "{c_cpf}" AS cpf
-                        FROM dados {where_sql}
-                    )
-                    SELECT
-                        ca.nome AS Nome,
-                        ca.cpf AS CPF,
-                        ca.nis AS NIS,
-                        ca.nascimento AS Nascimento
-                    FROM cad_atual ca
-                    INNER JOIN atend_cpf a ON a.cpf = ca.cpf
-                    ORDER BY ca.nome
-                    LIMIT 1000
-                """
-                df_atual = con.execute(sql_atual).df()
+            sub_dr, sub_atendidos, sub_nis = st.tabs([
+                "🔴 Demanda reprimida (nunca atendidos)",
+                "✅ Atendidos (estão nos dois bancos)",
+                "🪪 Sem CPF — cruzamento por NIS"
+            ])
 
-                if df_atual.empty:
-                    st.success("✅ Nenhuma coincidência encontrada entre os filtros atuais.")
-                else:
-                    st.metric("Pessoas nos dois bancos atualmente", f"{len(df_atual):,}")
-                    ev_atual = st.dataframe(
-                        df_atual, use_container_width=True, hide_index=True,
-                        on_select="rerun", selection_mode="single-row"
-                    )
-                    sel_atual = ev_atual.selection.rows if hasattr(ev_atual, "selection") else []
-                    if sel_atual:
-                        row_a = df_atual.iloc[sel_atual[0]]
-                        cpf_a = esc(str(row_a["CPF"]))
-                        st.markdown("---")
-                        st.subheader(f"👤 Perfil: {row_a['Nome']}")
-                        pa1, pa2, pa3, pa4 = st.columns(4)
-                        pa1.metric("CPF", row_a["CPF"])
-                        pa2.metric("NIS", row_a["NIS"] if row_a["NIS"] else "—")
-                        pa3.metric("Nascimento", row_a["Nascimento"] if row_a["Nascimento"] else "—")
-                        tot_a = run_val(f'SELECT COUNT(*) FROM dados WHERE "{c_cpf}" = \'{cpf_a}\'')
-                        pa4.metric("Atendimentos", f"{tot_a:,}")
-
-                        cols_ha = [c for c in [c_data, c_servico, c_unidade, c_login, c_categoria] if c]
-                        df_ha = run(
-                            "SELECT " + ", ".join([f'"{c}"' for c in cols_ha]) +
-                            f' FROM dados WHERE "{c_cpf}" = \'{cpf_a}\'' +
-                            (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 200"
-                        )
-                        st.dataframe(df_ha, use_container_width=True, hide_index=True)
-
-                    out_atual = io.BytesIO()
-                    with pd.ExcelWriter(out_atual, engine="openpyxl") as writer:
-                        df_atual.to_excel(writer, index=False, sheet_name="Nos 2 bancos")
-                    st.download_button(
-                        "⬇️ Exportar lista", out_atual.getvalue(), "cadunico_atendimentos_atual.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key="dl_atual"
-                    )
-            except Exception as e:
-                st.error(f"Erro no cruzamento: {e}")
-
-        # ── Cruzamento 2: 3+ ciclos de entrada/saída no CadÚnico ──
-        with sub2:
-            st.markdown("##### Pessoas com 3 ou mais ciclos de entrada/saída no CadÚnico")
-            st.caption("Um ciclo termina quando há um mês de ausência seguido de retorno ao programa.")
-            min_ciclos = st.number_input("Mínimo de ciclos", min_value=2, max_value=20, value=3, step=1, key="min_ciclos_cad")
-            try:
-                sql_ciclos = f"""
-                    WITH presencas AS (
-                        SELECT DISTINCT cpf, nome, nis, nascimento,
-                               STRPTIME(ref_cad, '%d/%m/%Y') AS periodo
-                        FROM cadunico
-                        WHERE cpf IS NOT NULL
-                    ),
-                    com_lag AS (
-                        SELECT
-                            cpf, nome, nis, nascimento, periodo,
-                            LAG(periodo) OVER (PARTITION BY cpf ORDER BY periodo) AS periodo_anterior,
-                            DATEDIFF('month', LAG(periodo) OVER (PARTITION BY cpf ORDER BY periodo), periodo) AS gap
-                        FROM presencas
-                    ),
-                    ciclos AS (
-                        SELECT
-                            cpf,
-                            FIRST(nome) AS nome,
-                            FIRST(nis) AS nis,
-                            FIRST(nascimento) AS nascimento,
-                            SUM(CASE WHEN gap >= 2 THEN 1 ELSE 0 END) + 1 AS num_ciclos,
-                            MIN(periodo) AS primeiro,
-                            MAX(periodo) AS ultimo,
-                            COUNT(*) AS total_meses_presente
-                        FROM com_lag
-                        GROUP BY cpf
-                        HAVING SUM(CASE WHEN gap >= 2 THEN 1 ELSE 0 END) + 1 >= {int(min_ciclos)}
-                    )
-                    SELECT
-                        nome AS Nome,
-                        cpf AS CPF,
-                        nis AS NIS,
-                        nascimento AS Nascimento,
-                        num_ciclos AS "Ciclos no CadÚnico",
-                        total_meses_presente AS "Meses presente",
-                        STRFTIME(primeiro, '%m/%Y') AS "Primeiro registro",
-                        STRFTIME(ultimo, '%m/%Y') AS "Último registro"
-                    FROM ciclos
-                    ORDER BY num_ciclos DESC, total_meses_presente DESC
-                    LIMIT 500
-                """
-                df_ciclos = con.execute(sql_ciclos).df()
-
-                if df_ciclos.empty:
-                    st.success(f"✅ Nenhuma pessoa com {int(min_ciclos)}+ ciclos detectados.")
-                else:
-                    mc1, mc2 = st.columns(2)
-                    mc1.metric("Pessoas com ciclos repetidos", f"{len(df_ciclos):,}")
-                    mc2.metric("Média de ciclos", f"{df_ciclos['Ciclos no CadÚnico'].mean():.1f}")
-
-                    top_n_cad = min(15, len(df_ciclos))
-                    df_top_cad = df_ciclos.head(top_n_cad).copy()
-                    fig_ciclos = px.bar(
-                        df_top_cad.iloc[::-1],
-                        x="Ciclos no CadÚnico", y="Nome", orientation="h",
-                        title=f"Top {top_n_cad} — Mais ciclos de entrada/saída",
-                        color="Ciclos no CadÚnico",
-                        color_continuous_scale=["#fde8e8", "#c0392b"],
-                        text="Ciclos no CadÚnico",
-                        height=max(300, top_n_cad * 28 + 80),
-                    )
-                    fig_ciclos.update_layout(coloraxis_showscale=False, yaxis_title=None, xaxis_title="Nº de ciclos")
-                    fig_ciclos.update_traces(textposition="outside")
-                    st.plotly_chart(fig_ciclos, use_container_width=True)
-
-                    st.markdown("##### Lista completa — clique para ver atendimentos")
-                    ev_ciclos = st.dataframe(
-                        df_ciclos, use_container_width=True, hide_index=True,
-                        on_select="rerun", selection_mode="single-row"
-                    )
-                    sel_ciclos = ev_ciclos.selection.rows if hasattr(ev_ciclos, "selection") else []
-                    if sel_ciclos:
-                        row_c = df_ciclos.iloc[sel_ciclos[0]]
-                        cpf_c = esc(str(row_c["CPF"]))
-                        st.markdown("---")
-                        st.subheader(f"👤 Perfil: {row_c['Nome']}")
-                        pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-                        pc1.metric("CPF", row_c["CPF"])
-                        pc2.metric("NIS", row_c["NIS"] if row_c["NIS"] else "—")
-                        pc3.metric("Nascimento", row_c["Nascimento"] if row_c["Nascimento"] else "—")
-                        pc4.metric("Ciclos", int(row_c["Ciclos no CadÚnico"]))
-                        if c_cpf:
-                            tot_c = run_val(f'SELECT COUNT(*) FROM dados WHERE "{c_cpf}" = \'{cpf_c}\'')
-                            pc5.metric("Atendimentos", f"{tot_c:,}")
-                            cols_hc = [c for c in [c_data, c_servico, c_unidade, c_login, c_categoria] if c]
-                            df_hc = run(
-                                "SELECT " + ", ".join([f'"{c}"' for c in cols_hc]) +
-                                f' FROM dados WHERE "{c_cpf}" = \'{cpf_c}\'' +
-                                (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 200"
-                            )
-                            if not df_hc.empty:
-                                st.markdown("##### Histórico de atendimentos")
-                                st.dataframe(df_hc, use_container_width=True, hide_index=True)
-                            else:
-                                st.caption("Nenhum atendimento encontrado para este CPF.")
-
-                    out_ciclos = io.BytesIO()
-                    with pd.ExcelWriter(out_ciclos, engine="openpyxl") as writer:
-                        df_ciclos.to_excel(writer, index=False, sheet_name="Ciclos CadÚnico")
-                    st.download_button(
-                        "⬇️ Exportar lista", out_ciclos.getvalue(), "cadunico_ciclos.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True, key="dl_ciclos"
-                    )
-            except Exception as e:
-                st.error(f"Erro na detecção de ciclos: {e}")
-
-        # ── Sub-aba 3: sem CPF, cruzando por NIS ──
-        with sub3:
-            st.markdown("##### Pessoas do CadÚnico sem CPF, cruzadas por NIS com a base de Atendimentos")
-            if not c_nis:
-                st.warning("A base de Atendimentos não tem coluna de NIS mapeada — não é possível cruzar por esta via.")
-            else:
+            # ── Demanda reprimida ──
+            with sub_dr:
+                st.markdown("##### Pessoas no CadÚnico que **não** aparecem na base de atendimentos")
                 try:
-                    sql_sem_cpf = f"""
-                        WITH cad_sem_cpf AS (
-                            SELECT DISTINCT nis, nome, rg, nascimento
+                    sql_dr = f"""
+                        WITH cad_ref AS (
+                            SELECT DISTINCT
+                                cpf, nome, nis, nascimento
                             FROM cadunico
-                            WHERE (cpf IS NULL OR cpf = '')
-                              AND nis IS NOT NULL
+                            WHERE ref_cad = '{esc(ref_sel)}'
+                              AND cpf IS NOT NULL AND cpf NOT IN ('', 'nan', 'None')
                         ),
-                        atend_nis AS (
-                            SELECT DISTINCT "{c_nis}" AS nis
-                            FROM dados {where_sql}
-                            WHERE "{c_nis}" IS NOT NULL
+                        cpfs_atendidos AS (
+                            SELECT DISTINCT CAST("{c_cpf}" AS VARCHAR) AS cpf
+                            FROM dados
+                            WHERE "{c_cpf}" IS NOT NULL
                         )
                         SELECT
-                            cs.nome AS Nome,
-                            cs.nis AS NIS,
-                            cs.rg AS RG,
-                            cs.nascimento AS Nascimento
-                        FROM cad_sem_cpf cs
-                        INNER JOIN atend_nis a ON CAST(a.nis AS VARCHAR) = CAST(cs.nis AS VARCHAR)
-                        ORDER BY cs.nome
-                        LIMIT 500
+                            c.nome   AS Nome,
+                            c.cpf    AS CPF,
+                            c.nis    AS NIS,
+                            c.nascimento AS Nascimento
+                        FROM cad_ref c
+                        LEFT JOIN cpfs_atendidos a ON a.cpf = c.cpf
+                        WHERE a.cpf IS NULL
+                        ORDER BY c.nome
+                        LIMIT 2000
                     """
-                    df_sem_cpf = con.execute(sql_sem_cpf).df()
+                    df_dr = con.execute(sql_dr).df()
 
-                    if df_sem_cpf.empty:
-                        st.success("✅ Nenhuma pessoa sem CPF encontrada em comum via NIS.")
-                    else:
-                        st.metric("Pessoas sem CPF cruzadas por NIS", f"{len(df_sem_cpf):,}")
-                        ev_sc = st.dataframe(
-                            df_sem_cpf, use_container_width=True, hide_index=True,
+                    total_cad_ref = con.execute(
+                        f"SELECT COUNT(DISTINCT cpf) FROM cadunico WHERE ref_cad = '{esc(ref_sel)}' AND cpf IS NOT NULL"
+                    ).fetchone()[0]
+                    total_atendidos_no_cad = total_cad_ref - len(df_dr)
+
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("No CadÚnico nesta competência", f"{total_cad_ref:,}")
+                    m2.metric("🔴 Nunca atendidos (demanda reprimida)", f"{len(df_dr):,}")
+                    m3.metric("✅ Já atendidos alguma vez", f"{total_atendidos_no_cad:,}")
+
+                    if not df_dr.empty:
+                        pct = len(df_dr) / total_cad_ref * 100 if total_cad_ref > 0 else 0
+                        st.progress(min(pct / 100, 1.0), text=f"{pct:.1f}% da base do CadÚnico não foi atendida")
+
+                        st.markdown("##### Lista — clique para ver o histórico no sistema de atendimentos")
+                        ev_dr = st.dataframe(
+                            df_dr, use_container_width=True, hide_index=True,
                             on_select="rerun", selection_mode="single-row"
                         )
-                        sel_sc = ev_sc.selection.rows if hasattr(ev_sc, "selection") else []
-                        if sel_sc:
-                            row_sc = df_sem_cpf.iloc[sel_sc[0]]
-                            nis_sc = esc(str(row_sc["NIS"]))
+                        sel_dr = ev_dr.selection.rows if hasattr(ev_dr, "selection") else []
+                        if sel_dr:
+                            row_dr = df_dr.iloc[sel_dr[0]]
+                            cpf_dr = esc(str(row_dr["CPF"]))
                             st.markdown("---")
-                            st.subheader(f"👤 Perfil: {row_sc['Nome']}")
-                            psc1, psc2, psc3 = st.columns(3)
-                            psc1.metric("NIS", row_sc["NIS"])
-                            psc2.metric("RG", row_sc["RG"] if row_sc["RG"] else "—")
-                            psc3.metric("Nascimento", row_sc["Nascimento"] if row_sc["Nascimento"] else "—")
+                            st.subheader(f"👤 {row_dr['Nome']}")
+                            pd1, pd2, pd3 = st.columns(3)
+                            pd1.metric("CPF", row_dr["CPF"])
+                            pd2.metric("NIS", row_dr["NIS"] if row_dr["NIS"] else "—")
+                            pd3.metric("Nascimento", row_dr["Nascimento"] if row_dr["Nascimento"] else "—")
 
-                            cols_hsc = [c for c in [c_data, c_servico, c_unidade, c_login, c_categoria] if c]
-                            df_hsc = run(
-                                "SELECT " + ", ".join([f'"{c}"' for c in cols_hsc]) +
-                                f' FROM dados WHERE CAST("{c_nis}" AS VARCHAR) = \'{nis_sc}\'' +
-                                (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 200"
-                            )
-                            st.markdown("##### Histórico de atendimentos")
-                            st.dataframe(df_hsc, use_container_width=True, hide_index=True)
+                            # Verifica se teve algum atendimento histórico (pode ter saído do filtro atual)
+                            tot_hist = run_val(f'SELECT COUNT(*) FROM dados WHERE CAST("{c_cpf}" AS VARCHAR) = \'{cpf_dr}\'')
+                            if tot_hist > 0:
+                                st.info(f"⚠️ Esta pessoa teve **{tot_hist}** atendimento(s) registrado(s) historicamente, mas não consta no período filtrado atualmente.")
+                                cols_h = [c for c in [c_data, c_servico, c_unidade, c_categoria] if c]
+                                df_h = run(
+                                    "SELECT " + ", ".join([f'"{c}"' for c in cols_h]) +
+                                    f' FROM dados WHERE CAST("{c_cpf}" AS VARCHAR) = \'{cpf_dr}\'' +
+                                    (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 100"
+                                )
+                                st.dataframe(df_h, use_container_width=True, hide_index=True)
+                            else:
+                                st.warning("❌ Nenhum atendimento encontrado para esta pessoa.")
 
-                        out_sc = io.BytesIO()
-                        with pd.ExcelWriter(out_sc, engine="openpyxl") as writer:
-                            df_sem_cpf.to_excel(writer, index=False, sheet_name="Sem CPF (via NIS)")
+                        st.markdown("---")
+                        out_dr = io.BytesIO()
+                        with pd.ExcelWriter(out_dr, engine="openpyxl") as writer:
+                            df_dr.to_excel(writer, index=False, sheet_name="Demanda Reprimida")
                         st.download_button(
-                            "⬇️ Exportar lista", out_sc.getvalue(), "cadunico_sem_cpf.xlsx",
+                            "⬇️ Exportar demanda reprimida", out_dr.getvalue(),
+                            f"demanda_reprimida_{ref_sel.replace('/', '-')}.xlsx",
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True, key="dl_sem_cpf"
+                            use_container_width=True, key="dl_dr"
                         )
+                    else:
+                        st.success("✅ Todos os cadastrados no CadÚnico nesta competência já foram atendidos.")
+
                 except Exception as e:
-                    st.error(f"Erro no cruzamento por NIS: {e}")
+                    st.error(f"Erro ao calcular demanda reprimida: {e}")
+
+            # ── Atendidos (nos dois bancos) ──
+            with sub_atendidos:
+                st.markdown("##### Pessoas que estão no CadÚnico **e** foram atendidas")
+                try:
+                    sql_at2 = f"""
+                        WITH cad_ref AS (
+                            SELECT DISTINCT cpf, nome, nis, nascimento
+                            FROM cadunico
+                            WHERE ref_cad = '{esc(ref_sel)}'
+                              AND cpf IS NOT NULL AND cpf NOT IN ('', 'nan', 'None')
+                        ),
+                        atend_agg AS (
+                            SELECT
+                                CAST("{c_cpf}" AS VARCHAR) AS cpf,
+                                COUNT(*) AS total_atendimentos
+                                {f', MAX(CAST("{c_data}" AS DATE)) AS ultimo_atendimento' if c_data else ''}
+                            FROM dados
+                            GROUP BY CAST("{c_cpf}" AS VARCHAR)
+                        )
+                        SELECT
+                            c.nome AS Nome,
+                            c.cpf AS CPF,
+                            c.nis AS NIS,
+                            c.nascimento AS Nascimento,
+                            a.total_atendimentos AS "Total atendimentos"
+                            {f', STRFTIME(a.ultimo_atendimento, \'%d/%m/%Y\') AS "Último atendimento"' if c_data else ''}
+                        FROM cad_ref c
+                        INNER JOIN atend_agg a ON a.cpf = c.cpf
+                        ORDER BY a.total_atendimentos DESC
+                        LIMIT 2000
+                    """
+                    df_at2 = con.execute(sql_at2).df()
+
+                    st.metric("Pessoas atendidas no CadÚnico desta competência", f"{len(df_at2):,}")
+
+                    ev_at2 = st.dataframe(
+                        df_at2, use_container_width=True, hide_index=True,
+                        on_select="rerun", selection_mode="single-row"
+                    )
+                    sel_at2 = ev_at2.selection.rows if hasattr(ev_at2, "selection") else []
+                    if sel_at2:
+                        row_a2 = df_at2.iloc[sel_at2[0]]
+                        cpf_a2 = esc(str(row_a2["CPF"]))
+                        st.markdown("---")
+                        st.subheader(f"👤 {row_a2['Nome']}")
+                        pa1, pa2, pa3, pa4 = st.columns(4)
+                        pa1.metric("CPF", row_a2["CPF"])
+                        pa2.metric("NIS", row_a2["NIS"] if row_a2["NIS"] else "—")
+                        pa3.metric("Nascimento", row_a2["Nascimento"] if row_a2["Nascimento"] else "—")
+                        pa4.metric("Atendimentos", f"{int(row_a2['Total atendimentos']):,}")
+
+                        cols_ha2 = [c for c in [c_data, c_servico, c_unidade, c_categoria] if c]
+                        df_ha2 = run(
+                            "SELECT " + ", ".join([f'"{c}"' for c in cols_ha2]) +
+                            f' FROM dados WHERE CAST("{c_cpf}" AS VARCHAR) = \'{cpf_a2}\'' +
+                            (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 200"
+                        )
+                        st.markdown("##### Histórico de atendimentos")
+                        st.dataframe(df_ha2, use_container_width=True, hide_index=True)
+
+                    out_at2 = io.BytesIO()
+                    with pd.ExcelWriter(out_at2, engine="openpyxl") as writer:
+                        df_at2.to_excel(writer, index=False, sheet_name="Atendidos no CadÚnico")
+                    st.download_button(
+                        "⬇️ Exportar lista", out_at2.getvalue(),
+                        f"cadunico_atendidos_{ref_sel.replace('/', '-')}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, key="dl_at2"
+                    )
+                except Exception as e:
+                    st.error(f"Erro: {e}")
+
+            # ── Sem CPF — cruzamento por NIS ──
+            with sub_nis:
+                st.markdown("##### Pessoas sem CPF no CadÚnico, cruzadas pelo NIS com os atendimentos")
+                if not c_nis:
+                    st.warning("A base de Atendimentos não tem coluna de NIS mapeada.")
+                else:
+                    try:
+                        sql_nis = f"""
+                            WITH cad_sem_cpf AS (
+                                SELECT DISTINCT nis, nome, rg, nascimento
+                                FROM cadunico
+                                WHERE ref_cad = '{esc(ref_sel)}'
+                                  AND (cpf IS NULL OR cpf IN ('', 'nan', 'None'))
+                                  AND nis IS NOT NULL
+                            ),
+                            atend_nis AS (
+                                SELECT DISTINCT CAST("{c_nis}" AS VARCHAR) AS nis
+                                FROM dados
+                                WHERE "{c_nis}" IS NOT NULL
+                            ),
+                            cad_sem_cpf_nao_atend AS (
+                                SELECT c.*, 'Nunca atendido' AS status
+                                FROM cad_sem_cpf c
+                                LEFT JOIN atend_nis a ON a.nis = c.nis
+                                WHERE a.nis IS NULL
+                            )
+                            SELECT nome AS Nome, nis AS NIS, rg AS RG, nascimento AS Nascimento, status AS Status
+                            FROM cad_sem_cpf_nao_atend
+                            ORDER BY nome LIMIT 1000
+                        """
+                        df_nis = con.execute(sql_nis).df()
+                        st.metric("Sem CPF e nunca atendidos (via NIS)", f"{len(df_nis):,}")
+                        ev_nis = st.dataframe(df_nis, use_container_width=True, hide_index=True,
+                                              on_select="rerun", selection_mode="single-row")
+                        sel_nis = ev_nis.selection.rows if hasattr(ev_nis, "selection") else []
+                        if sel_nis:
+                            row_nis = df_nis.iloc[sel_nis[0]]
+                            nis_v = esc(str(row_nis["NIS"]))
+                            st.markdown("---")
+                            st.subheader(f"👤 {row_nis['Nome']}")
+                            pn1, pn2, pn3 = st.columns(3)
+                            pn1.metric("NIS", row_nis["NIS"])
+                            pn2.metric("RG", row_nis["RG"] if row_nis["RG"] else "—")
+                            pn3.metric("Nascimento", row_nis["Nascimento"] if row_nis["Nascimento"] else "—")
+                            df_hnis = run(
+                                "SELECT " + ", ".join([f'"{c}"' for c in [c for c in [c_data, c_servico, c_unidade] if c]]) +
+                                f' FROM dados WHERE CAST("{c_nis}" AS VARCHAR) = \'{nis_v}\'' +
+                                (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 100"
+                            )
+                            if not df_hnis.empty:
+                                st.dataframe(df_hnis, use_container_width=True, hide_index=True)
+                        out_nis = io.BytesIO()
+                        with pd.ExcelWriter(out_nis, engine="openpyxl") as writer:
+                            df_nis.to_excel(writer, index=False, sheet_name="Sem CPF via NIS")
+                        st.download_button("⬇️ Exportar", out_nis.getvalue(), "cadunico_sem_cpf.xlsx",
+                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                           use_container_width=True, key="dl_nis")
+                    except Exception as e:
+                        st.error(f"Erro: {e}")
+
 
 # ─────────────────────────────────────
 # ABA 7 — EXPORTAR
