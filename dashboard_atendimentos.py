@@ -35,13 +35,14 @@ COL = {
 
 # Colunas do CadÚnico que vamos efetivamente usar (de ~190 colunas no arquivo original)
 CADUNICO_COLS = {
-    "cpf":        "p.num_cpf_pessoa",
-    "rg":         "p.num_identidade_pessoa",
-    "nis":        "p.num_nis_pessoa_atual",
-    "nome":       "p.nom_pessoa",
-    "nascimento": "p.dta_nasc_pessoa",
-    "ref_cad":    "d.ref_cad",
-    "marc_pbf":   "d.marc_pbf",
+    "cpf":           "p.num_cpf_pessoa",
+    "rg":            "p.num_identidade_pessoa",
+    "nis":           "p.num_nis_pessoa_atual",
+    "nome":          "p.nom_pessoa",
+    "nascimento":    "p.dta_nasc_pessoa",
+    "ref_cad":       "d.ref_cad",
+    "marc_pbf_fam":  "d.marc_pbf",
+    "marc_pbf_pes":  "p.marc_pbf",
 }
 
 # ══════════════════════════════════════════════
@@ -272,11 +273,14 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
         if raw_text is None:
             raise ValueError(f"Não consegui decodificar {uploaded_file.name}.")
 
+        import io as _io
+
         linhas = raw_text.splitlines()
         alvo_norm = set(_normalize_colname(v) for v in CADUNICO_COLS.values())
 
+        # Detecta separador e linha de cabeçalho: busca linha com mais hits de colunas conhecidas
         candidatos_sep = ["\t", ";", ",", "|"]
-        melhor_sep, melhor_header_idx, melhor_hits = None, None, 0
+        melhor_sep, melhor_header_idx, melhor_hits = "\t", 0, 0
         for sep in candidatos_sep:
             for idx, linha in enumerate(linhas[:30]):
                 campos_norm = [_normalize_colname(x) for x in linha.split(sep)]
@@ -287,18 +291,29 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
                     melhor_header_idx = idx
 
         if melhor_hits < 1:
-            # Diagnóstico: mostra primeiras 3 linhas e separadores tentados
-            preview_linhas = "\n".join(f"  linha {i}: {l[:120]!r}" for i, l in enumerate(linhas[:5]))
+            preview_linhas = "\n".join(f"  L{i}: {l[:200]!r}" for i, l in enumerate(linhas[:5]))
             raise ValueError(
                 f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name}.\n"
-                f"Primeiras linhas do arquivo:\n{preview_linhas}\n"
-                f"Colunas esperadas (ex): p.num_cpf_pessoa, p.num_nis_pessoa_atual"
+                f"Primeiras linhas:\n{preview_linhas}"
             )
 
-        import io as _io
+        # Conta campos esperados no cabeçalho
+        n_campos_header = len(linhas[melhor_header_idx].split(melhor_sep))
+
+        # Extrai só as linhas válidas: cabeçalho + linhas com número compatível de campos
+        linhas_limpas = [linhas[melhor_header_idx]]
+        for linha in linhas[melhor_header_idx + 1:]:
+            if not linha.strip():
+                continue
+            n = len(linha.split(melhor_sep))
+            # Aceita linhas com até 5 campos a mais ou a menos (células vazias no final)
+            if abs(n - n_campos_header) <= 5:
+                linhas_limpas.append(linha)
+
+        texto_limpo = "\n".join(linhas_limpas)
         df_raw = pd.read_csv(
-            _io.StringIO(raw_text), dtype=str,
-            sep=melhor_sep, skiprows=melhor_header_idx, engine="python",
+            _io.StringIO(texto_limpo), dtype=str,
+            sep=melhor_sep, engine="python",
             on_bad_lines="skip"
         )
     else:
@@ -314,11 +329,14 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
             col_map[key] = found
 
     if "cpf" not in col_map and "nis" not in col_map:
-        preview = ", ".join(f"'{c}'" for c in df_raw.columns[:20])
+        # Diagnóstico detalhado
+        cols_detectadas = ", ".join(f"'{c}'" for c in df_raw.columns[:30])
+        alvo_debug = ", ".join(f"'{v}'" for v in CADUNICO_COLS.values())
         raise ValueError(
-            f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name} "
-            f"({df_raw.shape[1]} colunas, sep={repr(melhor_sep)}, header_linha={melhor_header_idx}).\n"
-            f"Primeiras colunas lidas: {preview}"
+            f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name}.\n"
+            f"Sep detectado: {repr(melhor_sep)}, Header linha: {melhor_header_idx}, "
+            f"Colunas lidas ({df_raw.shape[1]}): {cols_detectadas}\n"
+            f"Esperava achar: {alvo_debug}"
         )
 
     cols_existentes = list(col_map.values())
@@ -494,7 +512,7 @@ st.markdown("---")
 # ══════════════════════════════════════════════
 # ABAS
 # ══════════════════════════════════════════════
-aba_reg, aba_alertas, aba_recorr, aba_cad, aba_exp = st.tabs(["📄 Individuos", "🚨 Alertas", "🔄 Recorrência Alternada", "🔗 CadÚnico", "📥 Exportar"])
+aba_reg, aba_alertas, aba_recorr, aba_cad, aba_bf, aba_exp = st.tabs(["📄 Individuos", "🚨 Alertas", "🔄 Recorrência Alternada", "🔗 CadÚnico", "💚 Bolsa Família", "📥 Exportar"])
 
 
 # ─────────────────────────────────────
@@ -1208,6 +1226,267 @@ with aba_cad:
                     except Exception as e:
                         st.error(f"Erro: {e}")
 
+
+# ─────────────────────────────────────
+# ABA — BOLSA FAMÍLIA
+# ─────────────────────────────────────
+with aba_bf:
+    st.subheader("💚 Bolsa Família — Cruzamento com Atendimentos")
+    st.caption(
+        "Análise em dois níveis: **família** (`d.marc_pbf`) e **pessoa** (`p.marc_pbf`). "
+        "Identifica beneficiários do BF que nunca foram atendidos (demanda reprimida) "
+        "e os que já foram atendidos."
+    )
+
+    if not cadunico_loaded:
+        st.info("📂 Carregue ao menos 1 arquivo do CadÚnico na barra lateral para usar esta aba.")
+    elif not c_cpf:
+        st.warning("A base de Atendimentos precisa ter coluna de CPF.")
+    else:
+        con = get_con()
+
+        # Verifica se as colunas de BF existem no Parquet
+        cad_cols = con.execute("DESCRIBE cadunico").df()["column_name"].tolist()
+        tem_marc_fam = "marc_pbf_fam" in cad_cols
+        tem_marc_pes = "marc_pbf_pes" in cad_cols
+
+        if not tem_marc_fam and not tem_marc_pes:
+            st.warning("Colunas `d.marc_pbf` e `p.marc_pbf` não encontradas nos arquivos carregados.")
+        else:
+            try:
+                refs_bf = con.execute(
+                    "SELECT DISTINCT ref_cad FROM cadunico WHERE ref_cad IS NOT NULL ORDER BY ref_cad"
+                ).df()["ref_cad"].tolist()
+            except Exception:
+                refs_bf = []
+
+            if not refs_bf:
+                st.warning("Nenhuma competência encontrada.")
+            else:
+                ref_bf = st.selectbox(
+                    "📅 Competência", refs_bf, index=len(refs_bf) - 1, key="ref_bf"
+                )
+
+                # Monta filtro de BF conforme colunas disponíveis
+                # Nível família: marc_pbf_fam = '1'
+                # Nível pessoa:  marc_pbf_pes = '1'
+                # "Bolsa Família" = família OU pessoa marcado
+                partes_bf = []
+                if tem_marc_fam:
+                    partes_bf.append("marc_pbf_fam = '1'")
+                if tem_marc_pes:
+                    partes_bf.append("marc_pbf_pes = '1'")
+                filtro_bf = " OR ".join(partes_bf)
+
+                # ── Métricas gerais ──
+                try:
+                    total_ref = con.execute(
+                        f"SELECT COUNT(DISTINCT cpf) FROM cadunico "
+                        f"WHERE ref_cad = '{esc(ref_bf)}' AND cpf IS NOT NULL"
+                    ).fetchone()[0]
+
+                    total_bf = con.execute(
+                        f"SELECT COUNT(DISTINCT cpf) FROM cadunico "
+                        f"WHERE ref_cad = '{esc(ref_bf)}' AND cpf IS NOT NULL AND ({filtro_bf})"
+                    ).fetchone()[0]
+
+                    if tem_marc_fam and tem_marc_pes:
+                        total_bf_fam = con.execute(
+                            f"SELECT COUNT(DISTINCT cpf) FROM cadunico "
+                            f"WHERE ref_cad = '{esc(ref_bf)}' AND cpf IS NOT NULL AND marc_pbf_fam = '1'"
+                        ).fetchone()[0]
+                        total_bf_pes = con.execute(
+                            f"SELECT COUNT(DISTINCT cpf) FROM cadunico "
+                            f"WHERE ref_cad = '{esc(ref_bf)}' AND cpf IS NOT NULL AND marc_pbf_pes = '1'"
+                        ).fetchone()[0]
+
+                    mb1, mb2, mb3, mb4 = st.columns(4)
+                    mb1.metric("Total no CadÚnico", f"{total_ref:,}")
+                    mb2.metric("💚 Beneficiários do BF", f"{total_bf:,}")
+                    if tem_marc_fam and tem_marc_pes:
+                        mb3.metric("Nível família (d.marc_pbf)", f"{total_bf_fam:,}")
+                        mb4.metric("Nível pessoa (p.marc_pbf)", f"{total_bf_pes:,}")
+                    pct_bf = total_bf / total_ref * 100 if total_ref > 0 else 0
+                    st.progress(min(pct_bf / 100, 1.0), text=f"{pct_bf:.1f}% do CadÚnico desta competência recebe BF")
+                except Exception as e:
+                    st.error(f"Erro nas métricas: {e}")
+
+                st.markdown("---")
+                sub_bf1, sub_bf2 = st.tabs([
+                    "🔴 Demanda reprimida (BF nunca atendido)",
+                    "✅ BF já atendido"
+                ])
+
+                # ── Sub-aba 1: demanda reprimida do BF ──
+                with sub_bf1:
+                    st.markdown("##### Beneficiários do Bolsa Família que **nunca foram atendidos**")
+                    try:
+                        nivel = st.radio(
+                            "Nível de marcação BF",
+                            (["Família (d.marc_pbf)"] if tem_marc_fam else []) +
+                            (["Pessoa (p.marc_pbf)"] if tem_marc_pes else []) +
+                            (["Família OU Pessoa"] if tem_marc_fam and tem_marc_pes else []),
+                            horizontal=True, key="nivel_dr_bf"
+                        )
+                        if nivel == "Família (d.marc_pbf)":
+                            filtro_nivel = "marc_pbf_fam = '1'"
+                        elif nivel == "Pessoa (p.marc_pbf)":
+                            filtro_nivel = "marc_pbf_pes = '1'"
+                        else:
+                            filtro_nivel = filtro_bf
+
+                        sql_bf_dr = f"""
+                            WITH bf_ref AS (
+                                SELECT DISTINCT cpf, nome, nis, nascimento,
+                                       {'marc_pbf_fam,' if tem_marc_fam else ''}
+                                       {'marc_pbf_pes' if tem_marc_pes else '1 AS _dummy'}
+                                FROM cadunico
+                                WHERE ref_cad = '{esc(ref_bf)}'
+                                  AND cpf IS NOT NULL AND cpf NOT IN ('', 'nan', 'None')
+                                  AND ({filtro_nivel})
+                            ),
+                            cpfs_atendidos AS (
+                                SELECT DISTINCT CAST("{c_cpf}" AS VARCHAR) AS cpf FROM dados
+                            )
+                            SELECT
+                                b.nome   AS Nome,
+                                b.cpf    AS CPF,
+                                b.nis    AS NIS,
+                                b.nascimento AS Nascimento
+                                {", CASE WHEN b.marc_pbf_fam = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Família\"" if tem_marc_fam else ""}
+                                {", CASE WHEN b.marc_pbf_pes = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Pessoa\"" if tem_marc_pes else ""}
+                            FROM bf_ref b
+                            LEFT JOIN cpfs_atendidos a ON a.cpf = b.cpf
+                            WHERE a.cpf IS NULL
+                            ORDER BY b.nome
+                            LIMIT 2000
+                        """
+                        df_bf_dr = con.execute(sql_bf_dr).df()
+
+                        mbdr1, mbdr2 = st.columns(2)
+                        mbdr1.metric("🔴 BF nunca atendidos", f"{len(df_bf_dr):,}")
+                        pct_dr = len(df_bf_dr) / total_bf * 100 if total_bf > 0 else 0
+                        mbdr2.metric("% do total BF sem atendimento", f"{pct_dr:.1f}%")
+
+                        if not df_bf_dr.empty:
+                            st.progress(min(pct_dr / 100, 1.0), text=f"{pct_dr:.1f}% dos beneficiários BF nunca foram atendidos")
+
+                            ev_bf_dr = st.dataframe(
+                                df_bf_dr, use_container_width=True, hide_index=True,
+                                on_select="rerun", selection_mode="single-row"
+                            )
+                            sel_bf_dr = ev_bf_dr.selection.rows if hasattr(ev_bf_dr, "selection") else []
+                            if sel_bf_dr:
+                                row_bd = df_bf_dr.iloc[sel_bf_dr[0]]
+                                cpf_bd = esc(str(row_bd["CPF"]))
+                                st.markdown("---")
+                                st.subheader(f"👤 {row_bd['Nome']}")
+                                pbd1, pbd2, pbd3 = st.columns(3)
+                                pbd1.metric("CPF", row_bd["CPF"])
+                                pbd2.metric("NIS", row_bd["NIS"] if row_bd["NIS"] else "—")
+                                pbd3.metric("Nascimento", row_bd["Nascimento"] if row_bd["Nascimento"] else "—")
+                                tot_bd = run_val(f'SELECT COUNT(*) FROM dados WHERE CAST("{c_cpf}" AS VARCHAR) = \'{cpf_bd}\'')
+                                if tot_bd > 0:
+                                    st.info(f"⚠️ Teve {tot_bd} atendimento(s) historicamente, mas fora do filtro atual.")
+                                    cols_hbd = [c for c in [c_data, c_servico, c_unidade, c_categoria] if c]
+                                    df_hbd = run(
+                                        "SELECT " + ", ".join([f'"{c}"' for c in cols_hbd]) +
+                                        f' FROM dados WHERE CAST("{c_cpf}" AS VARCHAR) = \'{cpf_bd}\'' +
+                                        (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 100"
+                                    )
+                                    st.dataframe(df_hbd, use_container_width=True, hide_index=True)
+                                else:
+                                    st.warning("❌ Nenhum atendimento encontrado.")
+
+                            out_bf_dr = io.BytesIO()
+                            with pd.ExcelWriter(out_bf_dr, engine="openpyxl") as writer:
+                                df_bf_dr.to_excel(writer, index=False, sheet_name="BF Demanda Reprimida")
+                            st.download_button(
+                                "⬇️ Exportar demanda reprimida BF", out_bf_dr.getvalue(),
+                                f"bf_demanda_reprimida_{ref_bf.replace('/', '-')}.xlsx",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True, key="dl_bf_dr"
+                            )
+                        else:
+                            st.success("✅ Todos os beneficiários do BF nesta competência já foram atendidos.")
+                    except Exception as e:
+                        st.error(f"Erro: {e}")
+
+                # ── Sub-aba 2: BF já atendido ──
+                with sub_bf2:
+                    st.markdown("##### Beneficiários do Bolsa Família que **já foram atendidos**")
+                    try:
+                        sql_bf_at = f"""
+                            WITH bf_ref AS (
+                                SELECT DISTINCT cpf, nome, nis, nascimento,
+                                       {'marc_pbf_fam,' if tem_marc_fam else ''}
+                                       {'marc_pbf_pes' if tem_marc_pes else '1 AS _dummy'}
+                                FROM cadunico
+                                WHERE ref_cad = '{esc(ref_bf)}'
+                                  AND cpf IS NOT NULL AND cpf NOT IN ('', 'nan', 'None')
+                                  AND ({filtro_bf})
+                            ),
+                            atend_agg AS (
+                                SELECT
+                                    CAST("{c_cpf}" AS VARCHAR) AS cpf,
+                                    COUNT(*) AS total_atendimentos
+                                    {f', MAX(CAST("{c_data}" AS DATE)) AS ultimo_atend' if c_data else ''}
+                                FROM dados
+                                GROUP BY CAST("{c_cpf}" AS VARCHAR)
+                            )
+                            SELECT
+                                b.nome AS Nome,
+                                b.cpf AS CPF,
+                                b.nis AS NIS,
+                                b.nascimento AS Nascimento,
+                                {f"CASE WHEN b.marc_pbf_fam = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Família\"," if tem_marc_fam else ""}
+                                {f"CASE WHEN b.marc_pbf_pes = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Pessoa\"," if tem_marc_pes else ""}
+                                a.total_atendimentos AS "Total atendimentos"
+                                {f", STRFTIME(a.ultimo_atend, '%d/%m/%Y') AS \"Último atendimento\"" if c_data else ""}
+                            FROM bf_ref b
+                            INNER JOIN atend_agg a ON a.cpf = b.cpf
+                            ORDER BY a.total_atendimentos DESC
+                            LIMIT 2000
+                        """
+                        df_bf_at = con.execute(sql_bf_at).df()
+
+                        st.metric("✅ Beneficiários BF já atendidos", f"{len(df_bf_at):,}")
+
+                        ev_bf_at = st.dataframe(
+                            df_bf_at, use_container_width=True, hide_index=True,
+                            on_select="rerun", selection_mode="single-row"
+                        )
+                        sel_bf_at = ev_bf_at.selection.rows if hasattr(ev_bf_at, "selection") else []
+                        if sel_bf_at:
+                            row_ba = df_bf_at.iloc[sel_bf_at[0]]
+                            cpf_ba = esc(str(row_ba["CPF"]))
+                            st.markdown("---")
+                            st.subheader(f"👤 {row_ba['Nome']}")
+                            pba1, pba2, pba3, pba4 = st.columns(4)
+                            pba1.metric("CPF", row_ba["CPF"])
+                            pba2.metric("NIS", row_ba["NIS"] if row_ba["NIS"] else "—")
+                            pba3.metric("Nascimento", row_ba["Nascimento"] if row_ba["Nascimento"] else "—")
+                            pba4.metric("Atendimentos", f"{int(row_ba['Total atendimentos']):,}")
+                            cols_hba = [c for c in [c_data, c_servico, c_unidade, c_categoria] if c]
+                            df_hba = run(
+                                "SELECT " + ", ".join([f'"{c}"' for c in cols_hba]) +
+                                f' FROM dados WHERE CAST("{c_cpf}" AS VARCHAR) = \'{cpf_ba}\'' +
+                                (f' ORDER BY "{c_data}" DESC' if c_data else "") + " LIMIT 200"
+                            )
+                            st.markdown("##### Histórico de atendimentos")
+                            st.dataframe(df_hba, use_container_width=True, hide_index=True)
+
+                        out_bf_at = io.BytesIO()
+                        with pd.ExcelWriter(out_bf_at, engine="openpyxl") as writer:
+                            df_bf_at.to_excel(writer, index=False, sheet_name="BF Atendidos")
+                        st.download_button(
+                            "⬇️ Exportar lista", out_bf_at.getvalue(),
+                            f"bf_atendidos_{ref_bf.replace('/', '-')}.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True, key="dl_bf_at"
+                        )
+                    except Exception as e:
+                        st.error(f"Erro: {e}")
 
 # ─────────────────────────────────────
 # ABA 7 — EXPORTAR
