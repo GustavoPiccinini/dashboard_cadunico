@@ -254,114 +254,224 @@ def _find_col(df_cols, target_lower):
     return None
 
 def processar_arquivo_cadunico(uploaded_file) -> str:
-    """Lê 1 arquivo do CadÚnico, extrai só as colunas relevantes, salva como Parquet. Retorna o caminho."""
+    """
+    Processa um arquivo do CadÚnico, extrai apenas as colunas necessárias
+    e salva em Parquet.
+    """
+    import io as _io
+    import csv
+
     safe_name = uploaded_file.name.replace("/", "_").replace("\\", "_")
     out_path = os.path.join(CADUNICO_DIR, f"{safe_name}.parquet")
 
-    # NÃO usa cache — reprocessa sempre para evitar Parquets corrompidos de versões anteriores
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
+
+    # =====================================================
+    # CSV
+    # =====================================================
     if suffix == ".csv":
+
         uploaded_file.seek(0)
         raw_bytes = uploaded_file.read()
+
         raw_text = None
-        for encoding in ["utf-8-sig", "utf-8", "latin1", "cp1252"]:
+        for enc in ["utf-8-sig", "utf-8", "latin1", "cp1252"]:
             try:
-                raw_text = raw_bytes.decode(encoding)
+                raw_text = raw_bytes.decode(enc)
                 break
             except Exception:
-                continue
-        if raw_text is None:
-            raise ValueError(f"Não consegui decodificar {uploaded_file.name}.")
+                pass
 
-        import io as _io
+        if raw_text is None:
+            raise ValueError(f"Não consegui decodificar {uploaded_file.name}")
 
         linhas = raw_text.splitlines()
-        alvo_norm = set(_normalize_colname(v) for v in CADUNICO_COLS.values())
 
-        # Detecta separador e linha de cabeçalho: busca linha com mais hits de colunas conhecidas
+        alvo_norm = {
+            _normalize_colname(v)
+            for v in CADUNICO_COLS.values()
+        }
+
         candidatos_sep = ["\t", ";", ",", "|"]
-        melhor_sep, melhor_header_idx, melhor_hits = "\t", 0, 0
+
+        melhor_sep = "\t"
+        melhor_header_idx = 0
+        melhor_hits = 0
+
         for sep in candidatos_sep:
-            for idx, linha in enumerate(linhas[:30]):
-                campos_norm = [_normalize_colname(x) for x in linha.split(sep)]
-                hits = sum(1 for c in campos_norm if c in alvo_norm)
+            for idx, linha in enumerate(linhas[:200]):
+
+                campos = [
+                    _normalize_colname(x)
+                    for x in linha.split(sep)
+                ]
+
+                hits = sum(
+                    1
+                    for c in campos
+                    if c in alvo_norm
+                )
+
                 if hits > melhor_hits:
                     melhor_hits = hits
                     melhor_sep = sep
                     melhor_header_idx = idx
 
-        if melhor_hits < 1:
-            preview_linhas = "\n".join(f"  L{i}: {l[:200]!r}" for i, l in enumerate(linhas[:5]))
+        if melhor_hits < 5:
+
+            preview_linhas = "\n".join(
+                f"L{i}: {l[:200]!r}"
+                for i, l in enumerate(linhas[:5])
+            )
+
             raise ValueError(
-                f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name}.\n"
+                f"Não encontrei as colunas do CadÚnico.\n\n"
+                f"Arquivo: {uploaded_file.name}\n\n"
                 f"Primeiras linhas:\n{preview_linhas}"
             )
 
-        # Conta campos esperados no cabeçalho
-        n_campos_header = len(linhas[melhor_header_idx].split(melhor_sep))
+        header_campos = linhas[melhor_header_idx].split(melhor_sep)
+        n_campos_header = len(header_campos)
 
-        # Extrai só as linhas válidas: cabeçalho + linhas com número compatível de campos
-        linhas_limpas = [linhas[melhor_header_idx]]
+        linhas_limpas = [
+            linhas[melhor_header_idx]
+        ]
+
         for linha in linhas[melhor_header_idx + 1:]:
+
             if not linha.strip():
                 continue
-            n = len(linha.split(melhor_sep))
-            # Aceita linhas com até 5 campos a mais ou a menos (células vazias no final)
-            if abs(n - n_campos_header) <= 5:
-                linhas_limpas.append(linha)
+
+            linha_lower = linha.lower().strip()
+
+            if (
+                linha_lower.startswith("total")
+                or linha_lower.startswith("quantidade")
+                or linha_lower.startswith("fim")
+            ):
+                continue
+
+            try:
+                qtd = len(linha.split(melhor_sep))
+
+                if abs(qtd - n_campos_header) <= 30:
+                    linhas_limpas.append(linha)
+
+            except Exception:
+                continue
 
         texto_limpo = "\n".join(linhas_limpas)
-        df_raw = pd.read_csv(
-            _io.StringIO(texto_limpo), dtype=str,
-            sep=melhor_sep, engine="python",
-            on_bad_lines="skip"
-        )
-    else:
-        df_raw = pd.read_excel(uploaded_file, dtype=str)
 
-    # Strip em todos os nomes de coluna (remove espaços antes/depois, inclusive " d.col")
-    df_raw.columns = [str(c).strip() for c in df_raw.columns]
+        try:
+
+            df_raw = pd.read_csv(
+                _io.StringIO(texto_limpo),
+                dtype=str,
+                sep=melhor_sep,
+                engine="python",
+                quoting=csv.QUOTE_NONE,
+                on_bad_lines="skip",
+            )
+
+        except Exception:
+
+            df_raw = pd.read_csv(
+                _io.StringIO(texto_limpo),
+                dtype=str,
+                sep=melhor_sep,
+                engine="python",
+                on_bad_lines="skip",
+            )
+
+    # =====================================================
+    # EXCEL
+    # =====================================================
+    else:
+
+        uploaded_file.seek(0)
+
+        df_raw = pd.read_excel(
+            uploaded_file,
+            dtype=str
+        )
+
+    # =====================================================
+    # NORMALIZAÇÃO
+    # =====================================================
+
+    df_raw.columns = [
+        str(c).strip()
+        for c in df_raw.columns
+    ]
 
     col_map = {}
+
     for key, target in CADUNICO_COLS.items():
-        found = _find_col(df_raw.columns, target)
+
+        found = _find_col(
+            df_raw.columns,
+            target
+        )
+
         if found:
             col_map[key] = found
 
     if "cpf" not in col_map and "nis" not in col_map:
-        # Diagnóstico detalhado
-        cols_detectadas = ", ".join(f"'{c}'" for c in df_raw.columns[:30])
-        alvo_debug = ", ".join(f"'{v}'" for v in CADUNICO_COLS.values())
+
+        cols_detectadas = ", ".join(
+            repr(c)
+            for c in df_raw.columns[:40]
+        )
+
         raise ValueError(
-            f"Não encontrei colunas de CPF nem NIS em {uploaded_file.name}.\n"
-            f"Sep detectado: {repr(melhor_sep)}, Header linha: {melhor_header_idx}, "
-            f"Colunas lidas ({df_raw.shape[1]}): {cols_detectadas}\n"
-            f"Esperava achar: {alvo_debug}"
+            f"Não encontrei CPF ou NIS.\n\n"
+            f"Separador: {repr(melhor_sep) if suffix=='.csv' else 'Excel'}\n"
+            f"Header: {melhor_header_idx if suffix=='.csv' else 0}\n"
+            f"Hits: {melhor_hits if suffix=='.csv' else '-'}\n"
+            f"Colunas:\n{cols_detectadas}"
         )
 
     cols_existentes = list(col_map.values())
+
     df_slim = df_raw[cols_existentes].copy()
+
     df_slim.columns = list(col_map.keys())
 
-    # Normaliza CPF/NIS/RG (remove .0, espaços)
     for c in ["cpf", "nis", "rg"]:
+
         if c in df_slim.columns:
+
             df_slim[c] = (
-                df_slim[c].astype(str)
+                df_slim[c]
+                .astype(str)
                 .str.replace(r"\.0$", "", regex=True)
                 .str.strip()
-                .replace({"nan": None, "None": None, "": None})
+                .replace(
+                    {
+                        "nan": None,
+                        "None": None,
+                        "": None,
+                    }
+                )
             )
 
-    # ref_cad para competência mensal — se ausente, usa nome do arquivo
     if "ref_cad" not in df_slim.columns:
-        df_slim["ref_cad"] = os.path.splitext(uploaded_file.name)[0]
+
+        df_slim["ref_cad"] = os.path.splitext(
+            uploaded_file.name
+        )[0]
 
     df_slim["arquivo_origem"] = uploaded_file.name
-    df_slim.to_parquet(out_path, index=False)
-    del df_raw, df_slim
-    return out_path
 
+    df_slim.to_parquet(
+        out_path,
+        index=False
+    )
+
+    del df_raw
+    del df_slim
+
+    return out_path
 
 cadunico_loaded = False
 if cadunico_files:
