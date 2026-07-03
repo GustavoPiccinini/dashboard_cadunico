@@ -222,6 +222,7 @@ c_quantia  = safe_col("quantia")
 # ══════════════════════════════════════════════
 st.sidebar.markdown("---")
 st.sidebar.title("📑 CadÚnico (opcional)")
+st.sidebar.caption("🔧 parser CadÚnico: v2-manual-parse (sem pd.read_csv)")
 st.sidebar.caption("Carregue 1 arquivo por mês — apenas as colunas relevantes são mantidas em memória.")
 
 cadunico_files = st.sidebar.file_uploader(
