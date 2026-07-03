@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import tempfile
 import streamlit as st
 import duckdb
@@ -253,21 +254,46 @@ def _find_col(df_cols, target_lower):
             return c
     return None
 
+# Palavras-chave de fallback: usadas quando o cabeçalho do CSV real não bate
+# exatamente com os nomes de coluna do banco (ex.: exportações do CECAD variam).
+_CADUNICO_KEYWORDS = {
+    "cpf":           ["cpf"],
+    "rg":            ["identidade"],
+    "nis":           ["nis"],
+    "nome":          ["nompessoa", "nome"],
+    "nascimento":    ["datanasc", "dtanasc", "nascimento"],
+    "ref_cad":       ["refcad"],
+    "marc_pbf_fam":  ["marcpbf"],
+    "marc_pbf_pes":  ["marcpbf"],
+}
+
+def _find_col_fuzzy(df_cols, key):
+    """Fallback: procura coluna cujo nome normalizado contenha alguma palavra-chave do campo."""
+    for kw in _CADUNICO_KEYWORDS.get(key, []):
+        for c in df_cols:
+            if kw in _normalize_colname_keep_prefix(c):
+                return c
+    return None
+
+def _split_line(linha, sep):
+    """Faz split de uma linha respeitando separadores literais ou regex (ex.: r'\\s{2,}')."""
+    if len(sep) > 1:
+        return re.split(sep, linha)
+    return linha.split(sep)
+
 def processar_arquivo_cadunico(uploaded_file) -> str:
     """
     Processa um arquivo do CadÚnico, extrai apenas as colunas necessárias
     e salva em Parquet.
     """
-    import io as _io
-    import csv
-
     safe_name = uploaded_file.name.replace("/", "_").replace("\\", "_")
     out_path = os.path.join(CADUNICO_DIR, f"{safe_name}.parquet")
 
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
 
     # =====================================================
-    # CSV
+    # CSV — parsing 100% manual (não usa o tokenizer do pandas,
+    # que quebra com rodapés/linhas irregulares do CECAD)
     # =====================================================
     if suffix == ".csv":
 
@@ -285,65 +311,63 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
         if raw_text is None:
             raise ValueError(f"Não consegui decodificar {uploaded_file.name}")
 
-        linhas = raw_text.splitlines()
+        linhas = [l for l in raw_text.splitlines() if l.strip() != ""]
 
-        alvo_norm = {
-            _normalize_colname(v)
-            for v in CADUNICO_COLS.values()
-        }
+        if not linhas:
+            raise ValueError(f"Arquivo {uploaded_file.name} está vazio.")
 
-        candidatos_sep = ["\t", ";", ",", "|"]
+        alvo_norm = {_normalize_colname(v) for v in CADUNICO_COLS.values()}
+        todas_kw = [kw for kws in _CADUNICO_KEYWORDS.values() for kw in kws]
 
-        melhor_sep = "\t"
-        melhor_header_idx = 0
-        melhor_hits = 0
+        candidatos_sep = ["\t", ";", ",", "|", r"\s{2,}"]
+
+        melhor_sep, melhor_header_idx, melhor_score, melhor_ncampos = None, 0, -1, 1
 
         for sep in candidatos_sep:
             for idx, linha in enumerate(linhas[:200]):
 
-                campos = [
-                    _normalize_colname(x)
-                    for x in linha.split(sep)
-                ]
+                campos = _split_line(linha, sep)
+                if len(campos) <= 1:
+                    continue
 
-                hits = sum(
-                    1
-                    for c in campos
-                    if c in alvo_norm
-                )
+                campos_norm = [_normalize_colname_keep_prefix(x) for x in campos]
 
-                if hits > melhor_hits:
-                    melhor_hits = hits
+                hits_exato = sum(1 for c in campos_norm if _normalize_colname(c) in alvo_norm)
+                hits_fuzzy = sum(1 for c in campos_norm if any(kw in c for kw in todas_kw))
+                score = hits_exato * 5 + hits_fuzzy
+
+                if score > melhor_score or (score == melhor_score and len(campos) > melhor_ncampos):
+                    melhor_score = score
                     melhor_sep = sep
                     melhor_header_idx = idx
+                    melhor_ncampos = len(campos)
 
-        if melhor_hits < 5:
+        # Fallback estrutural: nenhuma palavra-chave bateu — usa o separador
+        # que gera mais colunas de forma consistente (provável cabeçalho real)
+        if melhor_sep is None or melhor_score <= 0:
+            melhor_ncampos = 1
+            for sep in candidatos_sep:
+                for idx, linha in enumerate(linhas[:200]):
+                    campos = _split_line(linha, sep)
+                    if len(campos) > melhor_ncampos:
+                        melhor_ncampos = len(campos)
+                        melhor_sep = sep
+                        melhor_header_idx = idx
 
-            preview_linhas = "\n".join(
-                f"L{i}: {l[:200]!r}"
-                for i, l in enumerate(linhas[:5])
-            )
-
+        if melhor_sep is None or melhor_ncampos <= 1:
+            preview_linhas = "\n".join(f"L{i}: {l[:200]!r}" for i, l in enumerate(linhas[:5]))
             raise ValueError(
-                f"Não encontrei as colunas do CadÚnico.\n\n"
-                f"Arquivo: {uploaded_file.name}\n\n"
+                f"Não consegui detectar separador/cabeçalho em {uploaded_file.name}.\n\n"
                 f"Primeiras linhas:\n{preview_linhas}"
             )
 
-        header_campos = linhas[melhor_header_idx].split(melhor_sep)
+        header_campos = [c.strip() for c in _split_line(linhas[melhor_header_idx], melhor_sep)]
         n_campos_header = len(header_campos)
 
-        linhas_limpas = [
-            linhas[melhor_header_idx]
-        ]
-
+        linhas_dados = []
         for linha in linhas[melhor_header_idx + 1:]:
 
-            if not linha.strip():
-                continue
-
-            linha_lower = linha.lower().strip()
-
+            linha_lower = linha.strip().lower()
             if (
                 linha_lower.startswith("total")
                 or linha_lower.startswith("quantidade")
@@ -351,37 +375,24 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
             ):
                 continue
 
-            try:
-                qtd = len(linha.split(melhor_sep))
+            campos = _split_line(linha, melhor_sep)
 
-                if abs(qtd - n_campos_header) <= 30:
-                    linhas_limpas.append(linha)
-
-            except Exception:
+            # ignora rodapés muito curtos (ex.: "Total: 1234 registros")
+            if len(campos) < max(2, n_campos_header - 30):
                 continue
 
-        texto_limpo = "\n".join(linhas_limpas)
+            # normaliza o nº de campos ao do cabeçalho (preenche ou trunca)
+            if len(campos) < n_campos_header:
+                campos = campos + [""] * (n_campos_header - len(campos))
+            elif len(campos) > n_campos_header:
+                campos = campos[:n_campos_header]
 
-        try:
+            linhas_dados.append(campos)
 
-            df_raw = pd.read_csv(
-                _io.StringIO(texto_limpo),
-                dtype=str,
-                sep=melhor_sep,
-                engine="python",
-                quoting=csv.QUOTE_NONE,
-                on_bad_lines="skip",
-            )
+        if not linhas_dados:
+            raise ValueError(f"Nenhuma linha de dados válida encontrada em {uploaded_file.name}.")
 
-        except Exception:
-
-            df_raw = pd.read_csv(
-                _io.StringIO(texto_limpo),
-                dtype=str,
-                sep=melhor_sep,
-                engine="python",
-                on_bad_lines="skip",
-            )
+        df_raw = pd.DataFrame(linhas_dados, columns=header_campos, dtype=str)
 
     # =====================================================
     # EXCEL
@@ -413,6 +424,9 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
             target
         )
 
+        if not found:
+            found = _find_col_fuzzy(df_raw.columns, key)
+
         if found:
             col_map[key] = found
 
@@ -427,7 +441,7 @@ def processar_arquivo_cadunico(uploaded_file) -> str:
             f"Não encontrei CPF ou NIS.\n\n"
             f"Separador: {repr(melhor_sep) if suffix=='.csv' else 'Excel'}\n"
             f"Header: {melhor_header_idx if suffix=='.csv' else 0}\n"
-            f"Hits: {melhor_hits if suffix=='.csv' else '-'}\n"
+            f"Total de colunas lidas: {df_raw.shape[1]}\n"
             f"Colunas:\n{cols_detectadas}"
         )
 
