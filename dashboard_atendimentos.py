@@ -1223,6 +1223,14 @@ with aba_cad:
             with sub_atendidos:
                 st.markdown("##### Pessoas que estão no CadÚnico **e** foram atendidas")
                 try:
+                    frag_ultimo_atend = (
+                        ", STRFTIME(a.ultimo_atendimento, '%d/%m/%Y') AS \"Último atendimento\""
+                        if c_data else ""
+                    )
+                    frag_max_data = (
+                        f', MAX(CAST("{c_data}" AS DATE)) AS ultimo_atendimento'
+                        if c_data else ""
+                    )
                     sql_at2 = f"""
                         WITH cad_ref AS (
                             SELECT DISTINCT cpf, nome, nis, nascimento
@@ -1234,7 +1242,7 @@ with aba_cad:
                             SELECT
                                 CAST("{c_cpf}" AS VARCHAR) AS cpf,
                                 COUNT(*) AS total_atendimentos
-                                {f', MAX(CAST("{c_data}" AS DATE)) AS ultimo_atendimento' if c_data else ''}
+                                {frag_max_data}
                             FROM dados
                             GROUP BY CAST("{c_cpf}" AS VARCHAR)
                         )
@@ -1244,7 +1252,7 @@ with aba_cad:
                             c.nis AS NIS,
                             c.nascimento AS Nascimento,
                             a.total_atendimentos AS "Total atendimentos"
-                            {f', STRFTIME(a.ultimo_atendimento, \'%d/%m/%Y\') AS "Último atendimento"' if c_data else ''}
+                            {frag_ultimo_atend}
                         FROM cad_ref c
                         INNER JOIN atend_agg a ON a.cpf = c.cpf
                         ORDER BY a.total_atendimentos DESC
@@ -1460,6 +1468,8 @@ with aba_bf:
                         else:
                             filtro_nivel = filtro_bf
 
+                        frag_marc_fam_dr = ", CASE WHEN b.marc_pbf_fam = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Família\"" if tem_marc_fam else ""
+                        frag_marc_pes_dr = ", CASE WHEN b.marc_pbf_pes = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Pessoa\"" if tem_marc_pes else ""
                         sql_bf_dr = f"""
                             WITH bf_ref AS (
                                 SELECT DISTINCT cpf, nome, nis, nascimento,
@@ -1478,8 +1488,8 @@ with aba_bf:
                                 b.cpf    AS CPF,
                                 b.nis    AS NIS,
                                 b.nascimento AS Nascimento
-                                {", CASE WHEN b.marc_pbf_fam = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Família\"" if tem_marc_fam else ""}
-                                {", CASE WHEN b.marc_pbf_pes = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Pessoa\"" if tem_marc_pes else ""}
+                                {frag_marc_fam_dr}
+                                {frag_marc_pes_dr}
                             FROM bf_ref b
                             LEFT JOIN cpfs_atendidos a ON a.cpf = b.cpf
                             WHERE a.cpf IS NULL
@@ -1541,6 +1551,10 @@ with aba_bf:
                 with sub_bf2:
                     st.markdown("##### Beneficiários do Bolsa Família que **já foram atendidos**")
                     try:
+                        frag_marc_fam_col = "CASE WHEN b.marc_pbf_fam = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Família\"," if tem_marc_fam else ""
+                        frag_marc_pes_col = "CASE WHEN b.marc_pbf_pes = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Pessoa\"," if tem_marc_pes else ""
+                        frag_ultimo_atend_bf = ", STRFTIME(a.ultimo_atend, '%d/%m/%Y') AS \"Último atendimento\"" if c_data else ""
+                        frag_max_data_bf = f', MAX(CAST("{c_data}" AS DATE)) AS ultimo_atend' if c_data else ''
                         sql_bf_at = f"""
                             WITH bf_ref AS (
                                 SELECT DISTINCT cpf, nome, nis, nascimento,
@@ -1555,7 +1569,7 @@ with aba_bf:
                                 SELECT
                                     CAST("{c_cpf}" AS VARCHAR) AS cpf,
                                     COUNT(*) AS total_atendimentos
-                                    {f', MAX(CAST("{c_data}" AS DATE)) AS ultimo_atend' if c_data else ''}
+                                    {frag_max_data_bf}
                                 FROM dados
                                 GROUP BY CAST("{c_cpf}" AS VARCHAR)
                             )
@@ -1564,10 +1578,10 @@ with aba_bf:
                                 b.cpf AS CPF,
                                 b.nis AS NIS,
                                 b.nascimento AS Nascimento,
-                                {f"CASE WHEN b.marc_pbf_fam = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Família\"," if tem_marc_fam else ""}
-                                {f"CASE WHEN b.marc_pbf_pes = '1' THEN 'Sim' ELSE 'Não' END AS \"BF Pessoa\"," if tem_marc_pes else ""}
+                                {frag_marc_fam_col}
+                                {frag_marc_pes_col}
                                 a.total_atendimentos AS "Total atendimentos"
-                                {f", STRFTIME(a.ultimo_atend, '%d/%m/%Y') AS \"Último atendimento\"" if c_data else ""}
+                                {frag_ultimo_atend_bf}
                             FROM bf_ref b
                             INNER JOIN atend_agg a ON a.cpf = b.cpf
                             ORDER BY a.total_atendimentos DESC
