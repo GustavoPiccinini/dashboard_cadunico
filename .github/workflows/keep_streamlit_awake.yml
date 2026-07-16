@@ -1,0 +1,62 @@
+name: keep-streamlit-awake
+
+on:
+  schedule:
+    # Executa a cada 8 horas
+    - cron: "0 */8 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Instalar dependências
+        run: |
+          pip install selenium webdriver-manager
+
+      - name: Abrir Streamlit
+        run: |
+          python << 'EOF'
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.chrome.service import Service
+          from webdriver_manager.chrome import ChromeDriverManager
+          import time
+
+          options = Options()
+          options.add_argument("--headless=new")
+          options.add_argument("--no-sandbox")
+          options.add_argument("--disable-dev-shm-usage")
+          options.add_argument("--window-size=1920,1080")
+
+          driver = webdriver.Chrome(
+              service=Service(ChromeDriverManager().install()),
+              options=options
+          )
+
+          try:
+              url = "https://dashboardcadunico.streamlit.app/"
+              print(f"Acessando {url}")
+              driver.get(url)
+
+              # Aguarda o Streamlit carregar
+              time.sleep(20)
+
+              print("Título:", driver.title)
+              print("URL Final:", driver.current_url)
+
+          finally:
+              driver.quit()
+          EOF
