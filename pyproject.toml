@@ -1,7 +1,20 @@
 [project]
-name = "dashboard-cadunico"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+name = "dashboard-atendimentos"
+version = "1.0.0"
+description = "Dashboard de Atendimentos — Prefeitura de Jacarezinho"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.30",
+    "duckdb>=0.10",
+    "pandas>=2.0",
+    "plotly>=5.0",
+    "openpyxl>=3.1",
+    "pyarrow>=14.0",
+]
+ 
+[tool.uv]
+dev-dependencies = []
+ 
+[project.scripts]
+dashboard = "streamlit:main"
+ 
